@@ -1,0 +1,1 @@
+from local_attention_flax.local_attention import LocalSelfAttention, MultiHeadLocalAttention, local_attention
