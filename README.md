@@ -24,7 +24,7 @@ q = jax.random.normal(key, (batch_size, num_heads, seq_len, hidden_dim))
 k = jax.random.normal(key, (batch_size, num_heads, seq_len, hidden_dim))
 v = jax.random.normal(key, (batch_size, num_heads, seq_len, hidden_dim))
 
-x = local_attention(q, k, v, mask=None, window_size_left=128, window_size_right=128, stride=1, dropout_rate=0.1, dropout_rng = key)
+x = local_attention(q, k, v, mask=None, rel_pos_emb=None, window_size_left=128, window_size_right=128, dropout_rate=0.1, dropout_rng = key)
 ```
 
 Alternatively, you can use the wrapper flax modules that include Dense layers for self- or crossattention. `LocalSelfAttention` is comparable to [flax SelfAttention](https://flax.readthedocs.io/en/latest/api_reference/_autosummary/flax.linen.SelfAttention.html) and `MultiHeadLocalAttention` is comparable to [flax MultiHeadDotProductAttention](https://flax.readthedocs.io/en/latest/api_reference/_autosummary/flax.linen.MultiHeadDotProductAttention.html). I changed the mechanics dealing with random state, and allow the user to optionally pass a prng key which will run the dropout computation deterministically with that key. Flax decided to instead pass a deterministic flag, which allows for only one deterministic result.
@@ -36,7 +36,7 @@ hidden_dim = 64
 
 key = jax.random.PRNGKey(1)
 
-att = LocalSelfAttention(qkv_features=hidden_dim, out_features=hidden_dim, num_heads=2, window_size_left=128, window_size_right=128, stride=1, dropout_rate=0.1)
+att = LocalSelfAttention(qkv_features=hidden_dim, out_features=hidden_dim, num_heads=2, window_size_left=128, window_size_right=128, dropout_rate=0.1)
 
 x = jax.random.normal(key, (batch_size, seq_len, hidden_dim))
 

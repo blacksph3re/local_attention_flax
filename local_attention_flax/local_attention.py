@@ -23,28 +23,35 @@ from flax.linen.attention import combine_masks
 import math
 import functools
 
-@functools.partial(jax.jit, static_argnames=('stride', 'window_size_left', 'window_size_right', 'dropout_rate'))
+@functools.partial(jax.jit, static_argnames=('window_size_left', 'window_size_right', 'dropout_rate'))
 def local_row(i: Array,
               q: Array, 
               k_padded: Array, 
               v_padded: Array, 
               mask: Optional[Array],
-              stride: int=1, 
+              rel_pos_emb: Optional[Array], # (window_size_left + window_size_right, hidden)
               window_size_left: int=128, 
               window_size_right: int=128, 
               dropout_rate: float=0.0, 
               dropout_rng: Optional[PRNGKey]=None) -> Array:
   """ Computes local attention for `stride` rows of the attention matrix."""
-  attn_logits = jnp.matmul(
-    jax.lax.dynamic_slice_in_dim(q, i, stride, axis=-2),
-    jax.lax.dynamic_slice_in_dim(k_padded, i + (stride//2), window_size_left + window_size_right, axis=-1)) / np.sqrt(q.shape[-1])
 
-  if len(mask.shape) == len(q.shape):
-    mask_q = jax.lax.dynamic_slice_in_dim(mask, i, stride, axis=-2)
-  else:
-    mask_q = jnp.tile(jnp.expand_dims(mask, axis=-2), (1,) * (mask.ndim - 2) + (stride, 1))
+  q_slice = jnp.expand_dims(q, axis=-2)  # (..., batch, 1, hidden)
+  k_slice = jax.lax.dynamic_slice_in_dim(k_padded, i, window_size_left + window_size_right, axis=-1) # (..., batch, hidden, window_size_left + window_size_right)
+
+  attn_logits = jnp.matmul(
+    q_slice,
+    k_slice) / np.sqrt(q.shape[-1]) # (..., batch, 1, window_size_left + window_size_right)
+  
+  # Add relative position embeddings like https://arxiv.org/pdf/1809.04281.pdf sec 3.4, but without the skewing
+  # Skewing is not needed because we only have 1 query row
+  if rel_pos_emb is not None:
+    attn_logits += jnp.matmul(q_slice, rel_pos_emb.T) # (..., batch, 1, window_size_left + window_size_right)
+
+  
+  mask_q = jnp.expand_dims(mask, axis=-2)
   del mask
-  mask_qk = jax.lax.dynamic_slice_in_dim(mask_q, i + (stride//2), window_size_left + window_size_right, axis=-1)
+  mask_qk = jax.lax.dynamic_slice_in_dim(mask_q, i, window_size_left + window_size_right, axis=-1)
   del mask_q
   attn_logits = jnp.where(~mask_qk, -1e9, attn_logits)
   del mask_qk
@@ -58,17 +65,17 @@ def local_row(i: Array,
                   jnp.asarray(keep_prob, dtype=q.dtype))
     attn_weights = attn_weights * multiplier
 
-  value = jnp.matmul(attn_weights, jax.lax.dynamic_slice_in_dim(v_padded, i + (stride//2), window_size_left + window_size_right, axis=-2))
+  value = jnp.matmul(attn_weights, jax.lax.dynamic_slice_in_dim(v_padded, i, window_size_left + window_size_right, axis=-2))
   return value
 
-@functools.partial(jax.jit, static_argnames=('stride', 'window_size_left', 'window_size_right', 'dropout_rate'))
+@functools.partial(jax.jit, static_argnames=('window_size_left', 'window_size_right', 'dropout_rate'))
 def local_attention(q: Array, 
                     k: Array, 
                     v: Array, 
                     mask: Optional[Array]=None, 
+                    rel_pos_emb: Optional[Array]=None,
                     window_size_left: int=128,
                     window_size_right: int=128,
-                    stride: int=1,
                     dropout_rate: float=0.0, 
                     dropout_rng: Optional[PRNGKey]=None) -> Array:
   """ Computes local attention, optionally windowed with a stride.
@@ -77,11 +84,11 @@ def local_attention(q: Array,
     q: query, shape `(..., batch, seq_len, hidden)`
     k: key, shape `(..., batch, seq_len, hidden)`
     v: value, shape `(..., batch, seq_len, hidden)`
-    mask: mask, shape `(..., batch, seq_len)` or `(..., batch, seq_len, seq_len)` or None
+    mask: mask, shape `(..., batch, seq_len_k)` or `(..., batch, seq_len_q, seq_len_k)` or None
+      Elements with value False are masked out.
+    rel_pos_emb: relative positional embedding, shape `(window_size_left + window_size_right, hidden)`
     window_size_left: window size to the left of each token
     window_size_right: window size to the right of each token, set to zero for causal attention
-    stride: stride for windowing the attention computation, set to seq_len for global attention
-      or 1 for fully local attention
     dropout_rate: dropout rate
     dropout_rng: dropout rng key
   
@@ -94,9 +101,9 @@ def local_attention(q: Array,
   assert mask is None or mask.shape == q.shape[:-1] or mask.shape == q.shape, 'mask must be broadcastable to q'
   assert window_size_right >= 0, 'window_size_right must be non-negative'
   assert window_size_left >= 0, 'window_size_left must be non-negative'
-  assert stride >= 1 and q.shape[-2] % stride == 0, 'stride must divide seq_len, please pad your inputs accordingly and pass in a mask with the padding' # TODO allow for stride that doesn't divide seq_len (requires padding k,q,v again)
   assert dropout_rate == 0 or dropout_rng is not None, 'dropout_rng must be provided if dropout_rate > 0'
   assert dropout_rate <= 1 and dropout_rate >= 0, 'dropout_rate must be between 0 and 1'
+  assert rel_pos_emb is None or rel_pos_emb.shape == (window_size_left + window_size_right, q.shape[-1]), 'relative positional embedding must have shape (window_size_left + window_size_right, hidden)'
   
   seq_len = q.shape[-2]
   d_k = q.shape[-1]
@@ -104,15 +111,17 @@ def local_attention(q: Array,
   k_padded = jnp.swapaxes(k_padded, -1, -2) # (..., batch, hidden, seq_len_padded)
   v_padded = jnp.pad(v, [(0, 0)] * (v.ndim - 2) + [(window_size_left, window_size_right)] + [(0, 0)], mode='constant', constant_values=0)
   if mask is None:
-    mask = jnp.ones(q.shape[:-1], dtype=jnp.bool_)
+    mask = jnp.ones(seq_len, dtype=jnp.bool_)
   mask = jnp.pad(mask, [(0, 0)] * (mask.ndim - 1) + [(window_size_left, window_size_right)], mode='constant', constant_values=False)
 
   if dropout_rate > 0:
-    dropout_rng = random.split(dropout_rng, seq_len // stride)
+    dropout_rng = random.split(dropout_rng, seq_len)
 
-  i = jnp.arange(0, seq_len, stride)
-  res = jax.vmap(local_row, in_axes=(0,None, None, None, None, None, None, None, None, None if dropout_rate == 0 else 0), out_axes=(-2))(i, q, k_padded, v_padded, mask, stride, window_size_left, window_size_right, dropout_rate, dropout_rng)
-  return jnp.reshape(res, res.shape[:-3] + (seq_len, d_k))
+  i = jnp.arange(0, seq_len)
+  res = jax.vmap(local_row, 
+                 in_axes=(0, -2, None, None, -2 if mask.shape == k_padded.shape else None, None, None, None, None, None if dropout_rate == 0 else 0), 
+                 out_axes=(-2))(i, q, k_padded, v_padded, mask, rel_pos_emb, window_size_left, window_size_right, dropout_rate, dropout_rng)
+  return jnp.reshape(res, res.shape[:-3] + (seq_len, d_k)) # (..., batch, 1, seq_len, hidden) -> (..., batch, seq_len, hidden)
 
 class MultiHeadLocalAttention(Module):
   """Multi-head local attention. Each token can only attend to a fixed
@@ -135,7 +144,8 @@ class MultiHeadLocalAttention(Module):
       decode: whether to prepare and use an autoregressive cache.
       window_size_left: number of tokens to the left of the current token to attend to.
       window_size_right: number of tokens to the right of the current token to attend to.
-      stride: stride for the local attention window, must divide seq_len.
+      precision: numerical precision of the computation see `jax.lax.Precision`
+      use_rel_pos_emb: whether to use relative positional embeddings like in music transformer
   """
   num_heads: int
   dtype: Optional[Dtype] = None
@@ -149,8 +159,8 @@ class MultiHeadLocalAttention(Module):
   decode: bool = False
   window_size_left: int = 128
   window_size_right: int = 128
-  stride: int = 1
   precision: Optional[PrecisionLike] = None
+  use_rel_pos_emb: bool = False
 
   @compact
   def __call__(self,
@@ -200,6 +210,15 @@ class MultiHeadLocalAttention(Module):
                          dense(name='key')(inputs_kv),
                          dense(name='value')(inputs_kv))
 
+    # Relative positional embeddings
+    if self.use_rel_pos_emb:
+      rel_pos_emb = nn.Embed(num_embeddings=self.window_size_left+self.window_size_right, 
+                             features=head_dim, 
+                             name='rel_pos_emb',
+                             param_dtype=dtype)
+    else:
+      rel_pos_emb = None
+
     # During fast autoregressive decoding, we feed one position at a time,
     # and cache the keys and values step by step.
     if self.decode:
@@ -246,11 +265,11 @@ class MultiHeadLocalAttention(Module):
         jnp.swapaxes(key, -3, -2), # [batch..., n_heads, length, n_features_per_head]
         jnp.swapaxes(value, -3, -2), # [batch..., n_heads, length, n_features_per_head]
         mask=jnp.swapaxes(mask, -3, -2) if mask is not None else None,
+        rel_pos_emb=rel_pos_emb.embedding,
         dropout_rng=prng_key,
         dropout_rate=self.dropout_rate,
         window_size_left=self.window_size_left,
-        window_size_right=self.window_size_right,
-        stride=self.stride)
+        window_size_right=self.window_size_right)
 
     x = jnp.swapaxes(x, -3, -2)
 
@@ -261,7 +280,7 @@ class MultiHeadLocalAttention(Module):
                        bias_init=self.bias_init,
                        use_bias=self.use_bias,
                        dtype=dtype,
-                       param_dtype=self.param_dtype,
+                       param_dtype=dtype,
                        precision=self.precision,
                        name='out')(x)
     return out
